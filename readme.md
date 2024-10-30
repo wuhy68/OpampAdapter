@@ -1,10 +1,10 @@
-## Data Processing
+## SFT-Datasets
 
 
 
-### How to get the processed LongCite datasets
+### How to get the sft-datasets
 
 ``` shell
-sh longcite_process.sh
+unzip ./data/sft_datasets.zip
 ```
 
