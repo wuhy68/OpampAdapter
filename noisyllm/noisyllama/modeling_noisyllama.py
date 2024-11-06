@@ -268,26 +268,24 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class NoisyAdapterMLP(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, input_size):
         super().__init__()
         self.config = config
-        self.intermediate_size = config.intermediate_size
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = getattr(config, "head_dim", self.hidden_size // self.num_heads)
         self.adapter_dim = config.adapter_dim
         self.adapter_scaling = config.adapter_scaling
         self.adapter_rank = config.adapter_rank
-        self.adapter_down = nn.Linear(self.head_dim, self.adapter_dim, bias=False)
-        self.adapter_up = nn.Linear(self.adapter_dim, self.adapter_rank, bias=False)
+        self.adapter_down = nn.Linear(input_size, self.adapter_dim, bias=False)
+        self.adapter_up = nn.Linear(self.adapter_dim, input_size, bias=False)
         self.adapter_act = nn.GELU()
 
         self.adapter_dropout = nn.Dropout(p=0.1)
         self.adapter_scaling = self.adapter_scaling
 
     def forward(self, x):
+        residual = x
         x = self.adapter_dropout(x)
         x = self.adapter_scaling * self.adapter_up(self.adapter_act(self.adapter_down(x)))
+        x = x + residual
         return x
 
 
@@ -320,14 +318,14 @@ class LlamaAttention(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
 
-        self.adapter_lambda_q1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.adapter_lambda_k1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.adapter_lambda_q2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.adapter_lambda_k2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
+        # self.adapter_lambda = nn.Parameter(torch.FloatTensor(1))
 
-        self.noisy_k_adapter = NoisyAdapterMLP(config)
-        self.noisy_q_adapter = NoisyAdapterMLP(config)
-
+        self.q1_adapter = NoisyAdapterMLP(config, input_size=self.num_heads * self.head_dim)
+        self.k1_adapter = NoisyAdapterMLP(config, input_size=self.num_key_value_heads * self.head_dim)
+        
+        self.q2_adapter = NoisyAdapterMLP(config, input_size=self.num_heads * self.head_dim)
+        self.k2_adapter = NoisyAdapterMLP(config, input_size=self.num_key_value_heads * self.head_dim)
+        
         # TODO (joao): remove in v4.46 (RoPE is computed in the model, not in the decoder layers)
         self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
 
@@ -391,28 +389,39 @@ class LlamaAttention(nn.Module):
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        noisy_query_states = self.noisy_q_adapter(query_states)
-        noisy_key_states = self.noisy_k_adapter(key_states)
+        k_len = key_states.shape[2]
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-        noisy_attn_weights = torch.matmul(noisy_query_states, noisy_key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        q1_states = self.q1_adapter(query_states.reshape(bsz, q_len, -1).contiguous())
+        k1_states = self.k1_adapter(key_states.reshape(bsz, k_len, -1).contiguous())
+
+        q2_states = self.q2_adapter(query_states.reshape(bsz, q_len, -1).contiguous())
+        k2_states = self.k2_adapter(key_states.reshape(bsz, k_len, -1).contiguous())    
+
+        q1_states = q1_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k1_states = k1_states.view(bsz, k_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        q2_states = q2_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k2_states = k2_states.view(bsz, k_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        attn1_weights = torch.matmul(q1_states, k1_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        attn2_weights = torch.matmul(q2_states, k2_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
         if attention_mask is not None:  # no matter the length, we just slice it
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-            attn_weights = attn_weights + causal_mask
+            attn1_weights = attn1_weights + causal_mask
+            attn2_weights = attn2_weights + causal_mask
 
         # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+        attn1_weights = nn.functional.softmax(attn1_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn1_weights = nn.functional.dropout(attn1_weights, p=self.attention_dropout, training=self.training)
 
-        noisy_attn_weights = nn.functional.softmax(noisy_attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        noisy_attn_weights = nn.functional.dropout(noisy_attn_weights, p=self.attention_dropout, training=self.training)
+        attn2_weights = nn.functional.softmax(attn2_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn2_weights = nn.functional.dropout(attn2_weights, p=self.attention_dropout, training=self.training)
 
-        adapter_lambda_1 = torch.exp(torch.sum(self.adapter_lambda_q1 * self.adapter_lambda_k1, dim=-1).float()).type_as(query_states)
-        adapter_lambda_2 = torch.exp(torch.sum(self.adapter_lambda_q2 * self.adapter_lambda_k2, dim=-1).float()).type_as(query_states)
-        adapter_lambda = adapter_lambda_1 - adapter_lambda_2
+        adapter_lambda_d = 1
+        adapter_lambda_c = 1
 
-        attn_weights = attn_weights - adapter_lambda * noisy_attn_weights
+        attn_weights = adapter_lambda_d * (attn1_weights - attn2_weights) + adapter_lambda_c * (attn1_weights + attn2_weights) / 2
         attn_output = torch.matmul(attn_weights, value_states)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
@@ -535,15 +544,23 @@ class LlamaFlashAttention2(LlamaAttention):
             key_states = key_states.to(target_dtype)
             value_states = value_states.to(target_dtype)
 
-        noisy_query_states = self.noisy_q_adapter(query_states)
-        noisy_key_states = self.noisy_k_adapter(key_states)
+        k_len = key_states.shape[1]
 
-        print(noisy_query_states.shape, query_states.shape)
-        print(noisy_key_states.shape, key_states.shape)
+        q1_states = self.q1_adapter(query_states.reshape(bsz, q_len, -1).contiguous())
+        k1_states = self.k1_adapter(key_states.reshape(bsz, k_len, -1).contiguous())
 
-        attn_output = _flash_attention_forward(
-            query_states,
-            key_states,
+        q2_states = self.q2_adapter(query_states.reshape(bsz, q_len, -1).contiguous())
+        k2_states = self.k2_adapter(key_states.reshape(bsz, k_len, -1).contiguous())    
+
+        q1_states = q1_states.view(bsz, q_len, self.num_heads, self.head_dim)
+        k1_states = k1_states.view(bsz, k_len, self.num_key_value_heads, self.head_dim)
+
+        q2_states = q2_states.view(bsz, q_len, self.num_heads, self.head_dim)
+        k2_states = k2_states.view(bsz, k_len, self.num_key_value_heads, self.head_dim)
+
+        attn1_output = _flash_attention_forward(
+            q1_states,
+            k1_states,
             value_states,
             attention_mask,
             q_len,
@@ -554,11 +571,9 @@ class LlamaFlashAttention2(LlamaAttention):
             is_causal=self.is_causal,
         )
 
-        print(attn_output.shape)
-
-        noisy_attn_output = _flash_attention_forward(
-            noisy_query_states,
-            noisy_key_states,
+        attn2_output = _flash_attention_forward(
+            q2_states,
+            k2_states,
             value_states,
             attention_mask,
             q_len,
@@ -569,11 +584,10 @@ class LlamaFlashAttention2(LlamaAttention):
             is_causal=self.is_causal,
         )
 
-        adapter_lambda_1 = torch.exp(torch.sum(self.adapter_lambda_q1 * self.adapter_lambda_k1, dim=-1).float()).type_as(query_states)
-        adapter_lambda_2 = torch.exp(torch.sum(self.adapter_lambda_q2 * self.adapter_lambda_k2, dim=-1).float()).type_as(query_states)
-        adapter_lambda = adapter_lambda_1 - adapter_lambda_2
+        adapter_lambda_d = 1
+        adapter_lambda_c = 1
 
-        attn_output = attn_output - adapter_lambda * noisy_attn_output
+        attn_output = adapter_lambda_d * (attn1_output - attn2_output) + adapter_lambda_c * (attn1_output + attn2_output) / 2
 
         attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
         attn_output = self.o_proj(attn_output)
@@ -582,132 +596,11 @@ class LlamaFlashAttention2(LlamaAttention):
             attn_weights = None
 
         return attn_output, attn_weights, past_key_value
-
-
-class LlamaSdpaAttention(LlamaAttention):
-    """
-    Llama attention module using torch.nn.functional.scaled_dot_product_attention. This module inherits from
-    `LlamaAttention` as the weights of the module stays untouched. The only changes are on the forward pass to adapt to
-    SDPA API.
-    """
-
-    # Adapted from LlamaAttention.forward
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
-        **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        if output_attentions:
-            # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
-            logger.warning_once(
-                "LlamaModel is using LlamaSdpaAttention, but `torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to the manual attention implementation, "
-                'but specifying the manual implementation will be required from Transformers version v5.0.0 onwards. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
-            )
-            return super().forward(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_value,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-                cache_position=cache_position,
-                position_embeddings=position_embeddings,
-            )
-
-        bsz, q_len, _ = hidden_states.size()
-
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
-
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-
-        if position_embeddings is None:
-            logger.warning_once(
-                "The attention layers in this model are transitioning from computing the RoPE embeddings internally "
-                "through `position_ids` (2D tensor with the indexes of the tokens), to using externally computed "
-                "`position_embeddings` (Tuple of tensors, containing cos and sin). In v4.46 `position_ids` will be "
-                "removed and `position_embeddings` will be mandatory."
-            )
-            cos, sin = self.rotary_emb(value_states, position_ids)
-        else:
-            cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-        if past_key_value is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
-
-        noisy_query_states = self.noisy_q_adapter(query_states)
-        noisy_key_states = self.noisy_k_adapter(key_states)
-
-        causal_mask = attention_mask
-        if attention_mask is not None:
-            causal_mask = causal_mask[:, :, :, : key_states.shape[-2]]
-
-        # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
-        # Reference: https://github.com/pytorch/pytorch/issues/112577.
-        if query_states.device.type == "cuda" and causal_mask is not None:
-            query_states = query_states.contiguous()
-            key_states = key_states.contiguous()
-            value_states = value_states.contiguous()
-
-            noisy_query_states = noisy_query_states.contiguous()
-            noisy_key_states = noisy_key_states.contiguous()
-
-        # We dispatch to SDPA's Flash Attention or Efficient kernels via this `is_causal` if statement instead of an inline conditional assignment
-        # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
-        is_causal = True if causal_mask is None and q_len > 1 else False
-
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
-            query_states,
-            key_states,
-            value_states,
-            attn_mask=causal_mask,
-            dropout_p=self.attention_dropout if self.training else 0.0,
-            is_causal=is_causal,
-        )
-
-        noisy_attn_output = torch.nn.functional.scaled_dot_product_attention(
-            noisy_query_states,
-            noisy_key_states,
-            value_states,
-            attn_mask=causal_mask,
-            dropout_p=self.attention_dropout if self.training else 0.0,
-            is_causal=is_causal,
-        )
-
-        adapter_lambda_1 = torch.exp(torch.sum(self.adapter_lambda_q1 * self.adapter_lambda_k1, dim=-1).float()).type_as(query_states)
-        adapter_lambda_2 = torch.exp(torch.sum(self.adapter_lambda_q2 * self.adapter_lambda_k2, dim=-1).float()).type_as(query_states)
-        adapter_lambda = adapter_lambda_1 - adapter_lambda_2
-
-        attn_output = attn_output - adapter_lambda * noisy_attn_output
-
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.view(bsz, q_len, -1)
-
-        attn_output = self.o_proj(attn_output)
-
-        return attn_output, None, past_key_value
-
+    
 
 LLAMA_ATTENTION_CLASSES = {
     "eager": LlamaAttention,
     "flash_attention_2": LlamaFlashAttention2,
-    "sdpa": LlamaSdpaAttention,
 }
 
 
@@ -819,7 +712,7 @@ class LlamaPreTrainedModel(PreTrainedModel):
     _no_split_modules = ["LlamaDecoderLayer"]
     _skip_keys_device_placement = ["past_key_values"]
     _supports_flash_attn_2 = True
-    _supports_sdpa = True
+    _supports_sdpa = False
     _supports_cache_class = True
     _supports_quantized_cache = True
     _supports_static_cache = True
@@ -1236,6 +1129,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         num_logits_to_keep: int = 0,
+        **loss_kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Args:
@@ -1298,7 +1192,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
 
         loss = None
         if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **loss_kwargs)
 
         if not return_dict:
             output = (logits,) + outputs[1:]
