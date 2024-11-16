@@ -1,5 +1,6 @@
 TOT_CUDA="0,1,2,3,4,5,6,7"
 
+BASE_MODEL=""
 LORA_MODEL=""
 OPAMP_MODEL=""
 
