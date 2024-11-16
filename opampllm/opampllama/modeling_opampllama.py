@@ -418,7 +418,7 @@ class LlamaAttention(nn.Module):
         attn2_weights = nn.functional.softmax(attn2_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn2_weights = nn.functional.dropout(attn2_weights, p=self.attention_dropout, training=self.training)
 
-        adapter_lambda_d = 1
+        adapter_lambda_d = 10
         adapter_lambda_c = 1
 
         attn_weights = adapter_lambda_d * (attn1_weights - attn2_weights) + adapter_lambda_c * (attn1_weights + attn2_weights) / 2
@@ -584,7 +584,7 @@ class LlamaFlashAttention2(LlamaAttention):
             is_causal=self.is_causal,
         )
 
-        adapter_lambda_d = 1
+        adapter_lambda_d = 10
         adapter_lambda_c = 1
 
         attn_output = adapter_lambda_d * (attn1_output - attn2_output) + adapter_lambda_c * (attn1_output + attn2_output) / 2
