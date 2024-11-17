@@ -1,31 +1,166 @@
+import os
 import json
 import numpy as np
 import random, math
 import argparse,torch
-import os
 import json, tqdm, requests
 import yaml
-from models.models import *
 
-# import debugpy
-# try:
-#     # 5678 is the default attach port in the VS Code debug configurations. Unless a host and port are specified, host defaults to 127.0.0.1
-#     debugpy.listen(("localhost", 5678))
-#     print("Waiting for debugger attach")
-#     debugpy.wait_for_client()
-# except Exception as e:
-#     pass
+import transformers
+from transformers import GenerationConfig
 
-# {
-#             "name": "sh_file_debug",
-#             "type": "debugpy",
-#             "request": "attach",
-#             "connect": {
-#                 "host": "localhost",
-#                 "port": 9501
-#             }
-#         }
+from peft import PeftModel
+
+from opampllm.opampllama.configuration_opampllama import NoisyLlamaConfig
+from opampllm.opampllama.modeling_opampllama import LlamaForCausalLM
+
+import warnings
+
+warnings.filterwarnings("ignore")
+
+from transformers_utils import (
+    _load_pretrained_model,
+)
+import transformers.integrations
+import transformers.modeling_utils
+
+transformers.modeling_utils.PreTrainedModel._load_pretrained_model = (
+    _load_pretrained_model
+)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '--modelname', type=str, default='chatgpt',
+        help='model name'
+    )
+    parser.add_argument(
+        '--dataset', type=str, default='en',
+        help='evaluetion dataset',
+        choices=['en','zh','en_int','zh_int','en_fact','zh_fact','en_refine','zh_refine']
+    )
+    parser.add_argument(
+        '--plm', type=str, default='THUDM/chatglm-6b',
+        help='name of plm'
+    )
+    parser.add_argument(
+        '--lora', type=str, default='',
+        help='lora module'
+    )
+    parser.add_argument(
+        '--opamp', type=str, default='',
+        help='opamp adapter module'
+    )
+    parser.add_argument(
+        '--temp', type=float, default=0.7,
+        help='corpus id'
+    )
+    parser.add_argument(
+        '--noise_rate', type=float, default=0.0,
+        help='rate of noisy passages'
+    )
+    parser.add_argument(
+        '--correct_rate', type=float, default=0.0,
+        help='rate of correct passages'
+    )
+    parser.add_argument(
+        '--passage_num', type=int, default=5,
+        help='number of external passages'
+    )
+    parser.add_argument(
+        '--factchecking', type=bool, default=False,
+        help='whether to fact checking'
+    )
+    args = parser.parse_args()
+    print(args)
+
+    return args
+
+
+# llama prompt
+def generate_prompt(instruction, system=None):
+    if system is not None:
+        return f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+
+
+{system}<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+
+{instruction}<|eot_id|>
+<|start_header_id|>assistant<|end_header_id|>
+
+
+"""
+    else:
+        return f"""<|begin_of_text|><|start_header_id|>user<|end_header_id|>
+
+
+{instruction}<|eot_id|>
+<|start_header_id|>assistant<|end_header_id|>
+
+
+"""
+
+
+def load_model_and_tokenizer(plm, lora=None, opamp=None):
+
+    if opamp != "":   
+        model_config = NoisyLlamaConfig.from_pretrained(plm)
+        model_config.pretraining_tp = 1  ## without tensor parallelism rank
+
+        # NA Config
+        model_config.adapter_dim = 64
+        model_config.adapter_rank = model_config.head_dim
+        model_config.adapter_scaling = 1.0
+        model_config.adapter_lambda = 10
+
+        model = LlamaForCausalLM.from_pretrained(
+            plm,        
+            config=model_config,
+            torch_dtype=torch.bfloat16,
+            attn_implementation="flash_attention_2",
+            device_map="auto",
+            trust_remote_code=True
+        )
+    else:
+        model = transformers.AutoModelForCausalLM.from_pretrained(
+            plm,        
+            torch_dtype=torch.bfloat16,
+            attn_implementation="flash_attention_2",
+            device_map="auto",
+            trust_remote_code=True
+        )
+
+    if opamp != "":
+        print("load opamp adapter")
+
+        opamp_weights = torch.load(opamp, map_location=torch.device("cpu"))
+        weights_dict = {}
+        for k, v in opamp_weights.items():
+            new_k = k.replace("base_model.model.", "") if "base_model.model." in k else k
+            weights_dict[new_k] = v
+
+        model.load_state_dict(weights_dict, strict=False)
+
+    if lora != "":
+        print("load lora module")
+        model = PeftModel.from_pretrained(
+            model,
+            lora,
+            torch_dtype=torch.bfloat16,
+            device_map="auto"
+        )
+
+    # model = model.merge_and_unload()
+
+    tokenizer = transformers.AutoTokenizer.from_pretrained(plm, use_fast=False, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
     
+    return model, tokenizer
+
+
 def processdata(instance, noise_rate, passage_num, filename, correct_rate = 0):
     query = instance['query']
     ans = instance['answer']
@@ -75,7 +210,6 @@ def processdata(instance, noise_rate, passage_num, filename, correct_rate = 0):
                 pos_num = len(instance['positive'])
                 neg_num = passage_num - pos_num
         
-
         positive = instance['positive'][:pos_num]
         negative = instance['negative'][:neg_num]
 
@@ -107,6 +241,7 @@ def checkanswer(prediction, ground_truth):
         labels.append(int(flag))
     return labels
 
+
 def getevalue(results):
     results = np.array(results)
     results = np.max(results,axis = 0)
@@ -114,28 +249,58 @@ def getevalue(results):
         return False
     else:
         return True
-            
 
-def predict(query, ground_truth, docs, model, system, instruction, temperature, dataset):
+
+def generate(model, tokenizer, text, temperature):
+
+    inputs = tokenizer(text, return_tensors="pt")
+    input_ids = inputs["input_ids"].cuda()
+
+    generation_config = GenerationConfig(
+        temperature=temperature,
+        do_sample=True,
+        num_return_sequences=1,
+        repetition_penalty=1.0,
+        bos_token_id=tokenizer.bos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.eos_token_id,
+        max_new_tokens=512, # max_length=max_new_tokens+input_sequence
+        min_new_tokens=1, # min_length=min_new_tokens+input_sequence
+    )
+
+    with torch.no_grad():
+        generation_output = model.generate(
+            input_ids=input_ids,
+            generation_config=generation_config,
+            return_dict_in_generate=True,
+            output_scores=False,
+        )
+
+    split_word = "assistant"
+    seq = tokenizer.decode(generation_output.sequences[0], skip_special_tokens=True)
+    seq = seq.split(f"{split_word}")[-1].strip().replace('�','')
+
+    return seq
+
+
+def predict(dataset, query, ground_truth, docs, model, tokenizer, system, instruction, temperature):
 
     '''
     label: 0 for positive, 1 for negative, -1 for not enough information
-
     '''
     if len(docs) == 0:
-
         text = instruction.format(QUERY=query, DOCS='')
-        prediction = model.generate(text, temperature)
+        text = generate_prompt(text)
 
+        prediction = generate(model, tokenizer, text, temperature)
     else:
-
         docs = '\n'.join(docs)
-
-        
-
         text = instruction.format(QUERY=query, DOCS=docs)
+        text = generate_prompt(text, system)
+        
+        prediction = generate(model, tokenizer, text, temperature)
 
-        prediction = model.generate(text, temperature, system)
+    print(prediction)
 
     if 'zh' in dataset:
         prediction = prediction.replace(" ","")
@@ -150,103 +315,45 @@ def predict(query, ground_truth, docs, model, system, instruction, temperature, 
     if '事实性错误' in prediction or 'factual errors' in prediction:
         factlabel = 1
 
-    return labels,prediction, factlabel
-
+    return labels, prediction, factlabel
 
 
 if __name__ == '__main__':
 
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        '--modelname', type=str, default='chatgpt',
-        help='model name'
-    )
-    parser.add_argument(
-        '--dataset', type=str, default='en',
-        help='evaluetion dataset',
-        choices=['en','zh','en_int','zh_int','en_fact','zh_fact','en_refine','zh_refine']
-    )
-    parser.add_argument(
-        '--api_key', type=str, default='api_key',
-        help='api key of chatgpt'
-    )
-    parser.add_argument(
-        '--plm', type=str, default='THUDM/chatglm-6b',
-        help='name of plm'
-    )
-    parser.add_argument(
-        '--url', type=str, default='https://api.openai.com/v1/completions',
-        help='url of chatgpt'
-    )
-    parser.add_argument(
-        '--temp', type=float, default=0.7,
-        help='corpus id'
-    )
-    parser.add_argument(
-        '--noise_rate', type=float, default=0.0,
-        help='rate of noisy passages'
-    )
-    parser.add_argument(
-        '--correct_rate', type=float, default=0.0,
-        help='rate of correct passages'
-    )
-    parser.add_argument(
-        '--passage_num', type=int, default=5,
-        help='number of external passages'
-    )
-    parser.add_argument(
-        '--factchecking', type=bool, default=False,
-        help='whether to fact checking'
-    )
-    
-    args = parser.parse_args()
+    args = parse_args()
 
     modelname = args.modelname
     temperature = args.temp
     noise_rate = args.noise_rate
     passage_num = args.passage_num
 
+    if torch.cuda.is_available():
+        device = "cuda"
+    else:
+        device = "cpu"
+
     instances = []
-    with open(f'data/{args.dataset}.json','r') as f:
+    with open(f'evaluation/RGB/data/{args.dataset}.json','r') as f:
         for line in f:
             instances.append(json.loads(line))
     if 'en' in args.dataset:
-        resultpath = 'result-en'
+        resultpath = 'evaluation/RGB/result-en'
     elif 'zh' in args.dataset:
-        resultpath = 'result-zh'
+        resultpath = 'evaluation/RGB/result-zh'
     if not os.path.exists(resultpath):
         os.mkdir(resultpath)
 
     if args.factchecking:
-        prompt = yaml.load(open('config/instruction_fact.yaml', 'r'), Loader=yaml.FullLoader)[args.dataset[:2]]
+        prompt = yaml.load(open('evaluation/RGB/config/instruction_fact.yaml', 'r'), Loader=yaml.FullLoader)[args.dataset[:2]]
         resultpath = resultpath + '/fact'
     else:
-        prompt = yaml.load(open('config/instruction.yaml', 'r'), Loader=yaml.FullLoader)[args.dataset[:2]]
+        prompt = yaml.load(open('evaluation/RGB/config/instruction.yaml', 'r'), Loader=yaml.FullLoader)[args.dataset[:2]]
 
     system = prompt['system']
     instruction = prompt['instruction']
 
-    if modelname == 'chatgpt':
-        model = OpenAIAPIModel(api_key = args.api_key, url = args.url)
-    elif 'Llama-2' in modelname:
-        model = LLama2(plm = args.plm)
-    elif 'chatglm' in modelname:
-        model = ChatglmModel(plm = args.plm)
-    elif 'moss' in modelname:
-        model = Moss(plm = args.plm)
-    elif 'vicuna' in modelname:
-        model = Vicuna(plm = args.plm)
-    elif 'Qwen' in modelname:
-        model = Qwen(plm = args.plm)
-    elif 'Baichuan' in modelname:
-        model = Baichuan(plm = args.plm)
-    elif 'WizardLM' in modelname:
-        model = WizardLM(plm = args.plm)
-    elif 'BELLE' in modelname:
-        model = BELLE(plm = args.plm)
-    
-
+    model, tokenizer = load_model_and_tokenizer(args.plm, args.lora, args.opamp)
+    model.eval()
 
     filename = f'{resultpath}/prediction_{args.dataset}_{modelname}_temp{temperature}_noise{noise_rate}_passage{passage_num}_correct{args.correct_rate}.json'
     useddata = {}
@@ -271,7 +378,7 @@ if __name__ == '__main__':
                     docs = []
                 else:
                     query, ans, docs = processdata(instance, noise_rate, passage_num, args.dataset, args.correct_rate)
-                label,prediction,factlabel = predict(query, ans, docs, model,system,instruction,temperature,args.dataset)
+                label, prediction, factlabel = predict(args.dataset, query, ans, docs, model, tokenizer, system, instruction, temperature)
                 instance['label'] = label
                 newinstance = {
                     'id': instance['id'],
@@ -319,7 +426,5 @@ if __name__ == '__main__':
         scores['correct_rate'] = correct_rate
         scores['fact_tt'] = fact_tt
         scores['correct_tt'] = correct_tt
-
-    
 
     json.dump(scores,open(f'{resultpath}/prediction_{args.dataset}_{modelname}_temp{temperature}_noise{noise_rate}_passage{passage_num}_correct{args.correct_rate}_result.json','w'),ensure_ascii=False,indent=4)
