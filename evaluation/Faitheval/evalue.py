@@ -52,7 +52,6 @@ if __name__ == "__main__":
     
     if dataset == "counterfactual":
         dataset = load_dataset("Salesforce/FaithEval-counterfactual-v1.0", split="test")
-        dataset = dataset.select(range(10))
         for example in tqdm(dataset, desc="Processing examples"):
             # specify your custom prompt here. For example, if we want the model to directly generate an answer based on the context and question.
             prompt = f"""You are an expert in retrieval question answering. 
@@ -85,7 +84,6 @@ if __name__ == "__main__":
             valid_phrases = ['conflict']
         task_specific_prompt = "If there is conflict information or multiple answers from the context, the answer should be 'conflict'."
         dataset = load_dataset("Salesforce/FaithEval-inconsistent-v1.0", split="test")
-        dataset = dataset.select(range(10))
         for example in tqdm(dataset, desc="Processing examples"):
             # specify your custom prompt here. For example, if we want the model to directly generate an answer based on the context and question.
             prompt = f"""You are an expert in retrieval question answering. 
@@ -114,7 +112,6 @@ if __name__ == "__main__":
             valid_phrases = ['unknown']
         task_specific_prompt = "If there is no information available from the context, the answer should be 'unknown'. "
         dataset = load_dataset("Salesforce/FaithEval-unanswerable-v1.0", split="test")
-        dataset = dataset.select(range(10))
         for example in tqdm(dataset, desc="Processing examples"):
             # specify your custom prompt here. For example, if we want the model to directly generate an answer based on the context and question.
             prompt = f"""You are an expert in retrieval question answering. 
