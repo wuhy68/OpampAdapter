@@ -45,7 +45,7 @@ from transformers.utils import (
     logging,
     replace_return_docstrings,
 )
-from .configuration_noisyllama import NoisyLlamaConfig
+from .configuration_opampllama import NoisyLlamaConfig
 
 logger = logging.get_logger(__name__)
 
