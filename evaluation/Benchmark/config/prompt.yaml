@@ -1,0 +1,40 @@
+qasper:
+  system: null
+  instruction: "You are given a scientific article and a question. Answer the question as concisely as you can, using a single phrase or sentence if possible. If the question cannot be answered based on the information in the article, write \"unanswerable\". If the question is a yes/no question, answer \"yes\", \"no\", or \"unanswerable\". Do not provide any explanation."
+multifieldqa:
+  system: null
+  instruction: "Read the following text and answer briefly."
+loogle:
+  system: null
+  instruction: "Please answer the question based on the long document below."
+narrativeqa:
+  system: null
+  instruction: "You are given a story, which can be either a novel or a movie script, and a question. Answer the question asconcisely as you can, using a single phrase if possible. Do not provide any explanation."
+quality:
+  system: null
+  instruction: "Respond with the letter (A, B, C, or D) to choose the most appropriate answer from the options provided for each question based on the document. Only give me the letter and do not provide any explanation."
+MultiHopRAG:
+  system: null
+  instruction: "Below is a question followed by some documents from different sources. Please answer the question based on the documents. The answer to the question is a word or entity. If the provided information is insufficient to answer the question, respond 'Insufficient Information'. Answer directly without explanation."
+hotpotqa:
+  system: null
+  instruction: "Answer the question based on the given documents. Only give me the answer and do not output any other words.\n\nThe following are given documents."
+2wikimqa:
+  system: null
+  instruction: "Answer the question based on the given documents. Only give me the answer and do not output any other words.\n\nThe following are given documents."
+musique:
+  system: null
+  instruction: "Answer the question based on the given documents. Only give me the answer and do not output any other words.\n\nThe following are given documents."
+coqa:
+  system: "You are an artificial intelligence assistant. You should give helpful, detailed, and polite answer to the user's question based on the documents. You should also indicate when the answer cannot be found in the documents."
+  instruction: "Answer the following question with a short span. The answer needs to be just in a few words."
+quac:
+  system: "You are an artificial intelligence assistant. You should give helpful, detailed, and polite answer to the user's question based on the documents. You should also indicate when the answer cannot be found in the documents."
+  instruction: "Please give an answer in just one sentence."
+qrecc:
+  system: "You are an artificial intelligence assistant. You should give helpful, detailed, and polite answer to the user's question based on the documents. You should also indicate when the answer cannot be found in the documents."
+  instruction: "Please give an answer in just one sentence."
+doc2dial:
+  system: "You are an artificial intelligence assistant. You should give helpful, detailed, and polite answer to the user's question based on the documents. You should also indicate when the answer cannot be found in the documents."
+  instruction: "Please give an answer in just one sentence."
+    
