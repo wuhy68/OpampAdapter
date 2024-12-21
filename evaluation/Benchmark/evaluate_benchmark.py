@@ -266,14 +266,18 @@ def normalize_answer(s):
 
     return white_space_fix(remove_articles(remove_punc(lower(s))))
 
-def exact_match_score(prediction, ground_truth, strict=False):
+def exact_match_score(prediction, ground_truth, strict=False, new=True):
     mapdict = {True: 1, False: 0}
-    prediction = prediction.lower().strip()
-    ground_truth = ground_truth.lower().strip()
+    prediction = normalize_answer(prediction)
+    ground_truth = normalize_answer(ground_truth)
     if strict:
         return mapdict[prediction == ground_truth]
     else:
-        return mapdict[ground_truth in prediction]
+        if new:
+            ground_truth = ground_truth.split()
+            return mapdict[all([i in prediction for i in ground_truth])]
+        else:
+            return mapdict[ground_truth in prediction]
 
 def f1_score(prediction, ground_truth):
     prediction_tokens = normalize_answer(prediction).split()
