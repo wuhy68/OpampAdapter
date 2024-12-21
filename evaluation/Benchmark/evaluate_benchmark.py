@@ -72,6 +72,10 @@ def parse_args():
         '--url', type=str,
         help='URL'
     )
+    parser.add_argument(
+        '--noise_rate', type=float,
+        help='noise rate'
+    )
     args = parser.parse_args()
     print(args)
 
