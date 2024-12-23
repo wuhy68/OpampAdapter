@@ -86,6 +86,7 @@ def get_prompt(args, prompts, data):
     elif args.dataset in ["MultiHopRAG", "hotpotqa", "2wikimqa", "musique"]:
         prompt = f"Document:\n{doc}\nInstruction:\n{inst}\nQuestion:\n{ques}"
     elif args.dataset in ["coqa", "quac", "qrecc", "doc2dial"]:
+        doc = data["noisy_doc"]
         prompt = f"Document:\n{doc}\nInstruction:\n{inst}\nQuestion:\n{ques}"
     return prompt
 
