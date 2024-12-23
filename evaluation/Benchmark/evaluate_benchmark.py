@@ -9,6 +9,7 @@ import argparse,torch
 import json, requests
 from tqdm import tqdm
 from collections import Counter
+import Levenshtein
 
 from openai import OpenAI
 
@@ -18,7 +19,7 @@ from transformers import GenerationConfig, AutoModelForCausalLM, AutoTokenizer, 
 
 from peft import PeftModel
 
-from opampllm.opampllama.configuration_opampllama import NoisyLlamaConfig
+from opampllm.opampllama.configuration_opampllama import OpampLlamaConfig
 from opampllm.opampllama.modeling_opampllama import LlamaForCausalLM
 
 import warnings
@@ -61,19 +62,11 @@ def parse_args():
         help='opamp adapter module'
     )
     parser.add_argument(
-        '--temp', type=float, default=0.5,
-        help='corpus id'
+        '--temp', type=float, default=0.2,
+        help='temp'
     )
     parser.add_argument(
-        '--api_key', type=str,
-        help='API KEY'
-    )
-    parser.add_argument(
-        '--url', type=str,
-        help='URL'
-    )
-    parser.add_argument(
-        '--noise_rate', type=float,
+        '--noise_rate', type=float, default=0.8,
         help='noise rate'
     )
     args = parser.parse_args()
@@ -82,39 +75,18 @@ def parse_args():
     return args
 
 def get_prompt(args, prompts, data):
+    doc = data['documents']
+    inst = prompts[args.dataset]["instruction"]
+    ques = data["question"].split("[Question]:")[-1]
     if args.dataset in ["qasper", "multifieldqa", "loogle", "narrativeqa"]:
-        prompt = f"""{prompts[args.dataset]["instruction"]}
-        Document: 
-        {data['documents']}
-        Question: 
-        {data['question']}
-        Answer:""" 
+        prompt = f"Document:\n{doc}\nInstruction:\n{inst}\nQuestion:\n{ques}" 
     elif args.dataset == "quality":
-        prompt = f"""{prompts[args.dataset]["instruction"]}
-        Document: 
-        {data['documents']}
-        Question: 
-        {data['question']}
-        Options:
-        A {data['options'][0]}
-        B {data['options'][1]}
-        C {data['options'][2]}
-        D {data['options'][3]}
-        Answer:"""
+        options = data['options']
+        prompt = f"Document:\n{doc}\nInstruction:\n{inst}\nQuestion:\n{ques}\nOptions:\nA {options[0]}\nB {options[1]}\nC {options[2]}\nD {options[3]}"
     elif args.dataset in ["MultiHopRAG", "hotpotqa", "2wikimqa", "musique"]:
-        prompt = f"""{prompts[args.dataset]["instruction"]}
-        Documents: 
-        {data['documents']}
-        Question: 
-        {data['question']}
-        Answer:"""
+        prompt = f"Document:\n{doc}\nInstruction:\n{inst}\nQuestion:\n{ques}"
     elif args.dataset in ["coqa", "quac", "qrecc", "doc2dial"]:
-        prompt = f"""{prompts[args.dataset]["instruction"]}
-        Documents: 
-        {data['noisy_doc']}
-        Question: 
-        {data['question']}
-        Answer:"""
+        prompt = f"Document:\n{doc}\nInstruction:\n{inst}\nQuestion:\n{ques}"
     return prompt
 
 # llama prompt
@@ -129,7 +101,7 @@ def generate_prompt(instruction, system=None):
 {instruction}<|eot_id|>
 <|start_header_id|>assistant<|end_header_id|>
 
-
+Answer: 
 """
     else:
         return f"""<|begin_of_text|><|start_header_id|>user<|end_header_id|>
@@ -138,19 +110,39 @@ def generate_prompt(instruction, system=None):
 {instruction}<|eot_id|>
 <|start_header_id|>assistant<|end_header_id|>
 
-
+Answer: 
 """
+
+
+# base prompt
+def generate_prompt_o(instruction, system=None):
+    if system is not None:
+        return f"""<|begin_of_text|><|system|>
+{system}
+<|user|>
+{instruction}<|end_of_text|>
+<|assistant|>
+Answer: 
+"""
+    else:
+        return f"""<|begin_of_text|><|user|>
+{instruction}<|end_of_text|>
+<|assistant|>
+Answer: 
+"""
+    
+
 def load_model_and_tokenizer(plm, lora=None, opamp=None):
 
     if opamp != "":   
-        model_config = NoisyLlamaConfig.from_pretrained(plm)
+        model_config = OpampLlamaConfig.from_pretrained(plm)
         model_config.pretraining_tp = 1  ## without tensor parallelism rank
 
         # NA Config
         model_config.adapter_dim = 64
-        model_config.adapter_rank = model_config.head_dim
+        model_config.adapter_rank = model_config.adapter_dim
         model_config.adapter_scaling = 1.0
-        model_config.adapter_lambda = 10
+        model_config.adapter_lambda = 20
 
         model = LlamaForCausalLM.from_pretrained(
             plm,        
@@ -197,7 +189,8 @@ def load_model_and_tokenizer(plm, lora=None, opamp=None):
     
     return model, tokenizer
 
-def generate(model, tokenizer, text, temperature):
+
+def generate(model, tokenizer, text, temperature, split_word):
 
     inputs = tokenizer(text, return_tensors="pt")
     input_ids = inputs["input_ids"].cuda()
@@ -222,11 +215,11 @@ def generate(model, tokenizer, text, temperature):
             output_scores=False,
         )
 
-    split_word = "assistant"
     seq = tokenizer.decode(generation_output.sequences[0], skip_special_tokens=True)
     seq = seq.split(f"{split_word}")[-1].strip().replace('�','')
 
     return seq
+
 
 def get_response(args, modelname, prompt, system_prompt=None):
     client = OpenAI(
@@ -248,6 +241,7 @@ def get_response(args, modelname, prompt, system_prompt=None):
             )
     return completion.choices[0].message.content
 
+
 def normalize_answer(s):
     """Lower text and remove punctuation, articles and extra whitespace."""
 
@@ -266,18 +260,26 @@ def normalize_answer(s):
 
     return white_space_fix(remove_articles(remove_punc(lower(s))))
 
-def exact_match_score(prediction, ground_truth, strict=False, new=True):
+
+def exact_match_score(prediction, ground_truth, strict=False):
     mapdict = {True: 1, False: 0}
     prediction = normalize_answer(prediction)
     ground_truth = normalize_answer(ground_truth)
     if strict:
         return mapdict[prediction == ground_truth]
-    else:
-        if new:
-            ground_truth = ground_truth.split()
-            return mapdict[all([i in prediction for i in ground_truth])]
-        else:
-            return mapdict[ground_truth in prediction]
+    else: 
+        a = all([i in prediction for i in ground_truth.split()])
+        b = all([i in ground_truth for i in prediction.split()])
+        return mapdict[a | b]
+
+
+def partial_match_score(prediction, ground_truth):
+    prediction = normalize_answer(prediction)
+    ground_truth = normalize_answer(ground_truth)
+    distance = Levenshtein.distance(prediction, ground_truth)
+    max_len = max(len(prediction), len(ground_truth))
+    return 1 - distance / max_len if max_len > 0 else 1.0
+
 
 def f1_score(prediction, ground_truth):
     prediction_tokens = normalize_answer(prediction).split()
@@ -291,6 +293,7 @@ def f1_score(prediction, ground_truth):
     f1 = (2 * precision * recall) / (precision + recall)
     return f1
 
+
 def create_noisy_doc(golden, documents, num):
     noise_doc = [item for item in documents if item != golden]
     selected_strings = random.sample(noise_doc, min(num, len(noise_doc)))
@@ -299,18 +302,22 @@ def create_noisy_doc(golden, documents, num):
     noisy_doc = "\n".join(result)
     return noisy_doc
 
+
 if __name__ == "__main__":
    
     args = parse_args()
     modelname = args.modelname
+
+    model, tokenizer = load_model_and_tokenizer(args.plm, args.lora, args.opamp)
 
     if torch.cuda.is_available():
         device = "cuda"
     else:
         device = "cpu"
 
-    prompts = yaml.safe_load(open("./config/prompt.yaml"))
-    dataset = json.load(open("./data/benchmark.json"))
+    bench_path = "./"
+    prompts = yaml.safe_load(open(f"{bench_path}/config/prompt.yaml"))
+    dataset = json.load(open(f"{bench_path}/data/benchmark.json"))
     dataset = [data for data in dataset if data['tag'] == args.dataset]
     if args.dataset in ["coqa", "quac", "qrecc", "doc2dial"]:
         documents = list({data["documents"] for data in dataset})
@@ -332,31 +339,35 @@ if __name__ == "__main__":
     for data in tqdm(dataset):
         instruction_prompt = get_prompt(args, prompts, data)
         system_prompt = prompts[args.dataset]["system"]
-        if "gpt" or "qwen" in modelname:
-            response = get_response(args, modelname, instruction_prompt, system_prompt)
-        else:
-            model, tokenizer = load_model_and_tokenizer(args.plm, args.lora, args.opamp)
+        if args.lora == "":
+            # print("load original prompt")
             prompt = generate_prompt(instruction_prompt, system_prompt)
-            outputs = generate(model, tokenizer, prompt, args.temp)
-            response = outputs.strip()
+            split_word = "Answer:"
+        else:
+            # print("load inst prompt")
+            prompt = generate_prompt_o(instruction_prompt, system_prompt)
+            split_word = "Answer:"
+        outputs = generate(model, tokenizer, prompt, args.temp, split_word)
+        response = outputs.strip()
         pred_ans_pairs.append((response, data['answer']))
-    with open(f"./output/{args.dataset}_{modelname}.json", "w", encoding="utf-8") as f:
+    with open(f"{bench_path}/output/{args.dataset}_{modelname}.json", "w", encoding="utf-8") as f:
         json.dump(pred_ans_pairs, f, ensure_ascii=False)
     
     total_score_em = 0.
+    total_score_pm = 0.
     total_score_f1 = 0.
     for (prediction, ground_truths) in pred_ans_pairs:
         score_em = 0.
+        score_pm = 0.
         score_f1 = 0.
         for ground_truth in ground_truths:
             score_em = max(score_em, exact_match_score(prediction, ground_truth))
+            score_pm = max(score_pm, partial_match_score(prediction, ground_truth))
             score_f1 = max(score_f1, f1_score(prediction, ground_truth))
+        score_em = max(score_em, exact_match_score(prediction, " ".join(ground_truths)))
         total_score_em += score_em
+        total_score_pm += score_pm
         total_score_f1 += score_f1
     
-    with open(f"./output/{args.dataset}_{modelname}_score.json", "w", encoding="utf-8") as f:
-        json.dump({"em": round(100 * total_score_em / len(pred_ans_pairs), 2), "f1": round(100 * total_score_f1 / len(pred_ans_pairs), 2)}, f, ensure_ascii=False)
-    
-    
-    
-    
+    with open(f"{bench_path}/output/{args.dataset}_{modelname}_score.json", "w", encoding="utf-8") as f:
+        json.dump({"em": round(100 * total_score_em / len(pred_ans_pairs), 2), "pm": round(100 * total_score_pm / len(pred_ans_pairs), 2), "f1": round(100 * total_score_f1 / len(pred_ans_pairs), 2)}, f, ensure_ascii=False)
