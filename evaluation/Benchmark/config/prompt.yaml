@@ -9,7 +9,7 @@ quality:
   instruction: "Respond with the letter (A, B, C, or D) to choose the most appropriate answer from the options provided for each question based on the document. Only give me the letter and do not provide any explanation."
 MultiHopRAG:
   system: You are an accurate and reliable AI assistant that can answer questions with the help of retrieved documents. Retrieved documents may contain noisy irrelevant information. Please respond with the exact answer based on the retrieved documents ignoring noisy irrelevant details.
-  instruction: "Below is a question based on the given documents from different sources. Please answer the question briefly based on the documents. The answer to the question is a word or entity. If the provided information is insufficient to answer the question, respond 'Insufficient Information'. Answer the question as concisely as you can, using a single phrase if possible."
+  instruction: "Below is a question based on the given documents from different sources. Please answer the question briefly based on the documents. The answer to the question is a word or entity. Answer the question as concisely as you can, using a single phrase if possible."
 coqa:
   system: "You are an accurate and reliable AI assistant that can answer questions with the help of retrieved documents. Retrieved documents may contain noisy irrelevant information. Please respond with the exact answer based on the retrieved documents ignoring noisy irrelevant details."
   instruction: "Please answer the question briefly based on the given documents. You should indicate when the answer cannot be found in the documents. Answer the question as concisely as you can, using a single phrase if possible."
