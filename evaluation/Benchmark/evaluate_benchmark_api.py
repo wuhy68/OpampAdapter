@@ -69,6 +69,10 @@ def parse_args():
         '--noise_rate', type=float, default=0.8,
         help='noise rate'
     )
+    parser.add_argument(
+        '--api_key', type=str, default='',
+        help='api_key'
+    )
     args = parser.parse_args()
     print(args)
 
