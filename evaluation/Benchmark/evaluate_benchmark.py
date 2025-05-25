@@ -143,7 +143,7 @@ def load_model_and_tokenizer(plm, lora=None, opamp=None):
         model_config.adapter_dim = 64
         model_config.adapter_rank = model_config.adapter_dim
         model_config.adapter_scaling = 1.0
-        model_config.adapter_lambda = 20
+        model_config.adapter_lambda = 10
 
         model = LlamaForCausalLM.from_pretrained(
             plm,        

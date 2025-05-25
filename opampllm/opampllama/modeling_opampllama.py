@@ -45,11 +45,11 @@ from transformers.utils import (
     logging,
     replace_return_docstrings,
 )
-from .configuration_opampllama import NoisyLlamaConfig
+from .configuration_opampllama import OpampLlamaConfig
 
 logger = logging.get_logger(__name__)
 
-_CONFIG_FOR_DOC = "NoisyNoisyLlamaConfig"
+_CONFIG_FOR_DOC = "OpampLlamaConfig"
 
 
 class LlamaRMSNorm(nn.Module):
@@ -84,7 +84,7 @@ class LlamaRotaryEmbedding(nn.Module):
         device=None,
         scaling_factor=1.0,
         rope_type="default",
-        config: Optional[NoisyLlamaConfig] = None,
+        config: Optional[OpampLlamaConfig] = None,
     ):
         super().__init__()
         # TODO (joao): remove the `if` below, only used for BC
@@ -267,7 +267,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
-class NoisyAdapterMLP(nn.Module):
+class OpampAdapterMLP(nn.Module):
     def __init__(self, config, input_size):
         super().__init__()
         self.config = config
@@ -292,7 +292,7 @@ class NoisyAdapterMLP(nn.Module):
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: NoisyLlamaConfig, layer_idx: Optional[int] = None):
+    def __init__(self, config: OpampLlamaConfig, layer_idx: Optional[int] = None):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -319,12 +319,16 @@ class LlamaAttention(nn.Module):
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
 
         # self.adapter_lambda = nn.Parameter(torch.FloatTensor(1))
+        self.adapter_layer = config.adapter_layer
 
-        self.q1_adapter = NoisyAdapterMLP(config, input_size=self.num_heads * self.head_dim)
-        self.k1_adapter = NoisyAdapterMLP(config, input_size=self.num_key_value_heads * self.head_dim)
-        
-        self.q2_adapter = NoisyAdapterMLP(config, input_size=self.num_heads * self.head_dim)
-        self.k2_adapter = NoisyAdapterMLP(config, input_size=self.num_key_value_heads * self.head_dim)
+        if self.layer_idx % self.adapter_layer == 0: 
+            self.q1_adapter = OpampAdapterMLP(config, input_size=self.num_heads * self.head_dim)
+            self.k1_adapter = OpampAdapterMLP(config, input_size=self.num_key_value_heads * self.head_dim)
+            
+            self.q2_adapter = OpampAdapterMLP(config, input_size=self.num_heads * self.head_dim)
+            self.k2_adapter = OpampAdapterMLP(config, input_size=self.num_key_value_heads * self.head_dim)
+
+            self.adapter_lambda_d = config.adapter_lambda
         
         # TODO (joao): remove in v4.46 (RoPE is computed in the model, not in the decoder layers)
         self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
@@ -386,42 +390,58 @@ class LlamaAttention(nn.Module):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
+        if self.layer_idx % self.adapter_layer == 0: 
+            k_len = key_states.shape[2]
 
-        k_len = key_states.shape[2]
+            q1_states = self.q1_adapter(query_states.transpose(1, 2).reshape(bsz, q_len, -1).contiguous())
+            k1_states = self.k1_adapter(key_states.transpose(1, 2).reshape(bsz, k_len, -1).contiguous())
 
-        q1_states = self.q1_adapter(query_states.reshape(bsz, q_len, -1).contiguous())
-        k1_states = self.k1_adapter(key_states.reshape(bsz, k_len, -1).contiguous())
+            q2_states = self.q2_adapter(query_states.transpose(1, 2).reshape(bsz, q_len, -1).contiguous())
+            k2_states = self.k2_adapter(key_states.transpose(1, 2).reshape(bsz, k_len, -1).contiguous())    
 
-        q2_states = self.q2_adapter(query_states.reshape(bsz, q_len, -1).contiguous())
-        k2_states = self.k2_adapter(key_states.reshape(bsz, k_len, -1).contiguous())    
+            q1_states = q1_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+            k1_states = k1_states.view(bsz, k_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        q1_states = q1_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k1_states = k1_states.view(bsz, k_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+            q2_states = q2_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+            k2_states = k2_states.view(bsz, k_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        q2_states = q2_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k2_states = k2_states.view(bsz, k_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+            k1_states = repeat_kv(k1_states, self.num_key_value_groups)
+            k2_states = repeat_kv(k2_states, self.num_key_value_groups)
+            value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        attn1_weights = torch.matmul(q1_states, k1_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-        attn2_weights = torch.matmul(q2_states, k2_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+            attn1_weights = torch.matmul(q1_states, k1_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+            attn2_weights = torch.matmul(q2_states, k2_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
-        if attention_mask is not None:  # no matter the length, we just slice it
-            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-            attn1_weights = attn1_weights + causal_mask
-            attn2_weights = attn2_weights + causal_mask
+            if attention_mask is not None:  # no matter the length, we just slice it
+                causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+                attn1_weights = attn1_weights + causal_mask
+                attn2_weights = attn2_weights + causal_mask
 
-        # upcast attention to fp32
-        attn1_weights = nn.functional.softmax(attn1_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn1_weights = nn.functional.dropout(attn1_weights, p=self.attention_dropout, training=self.training)
+            # upcast attention to fp32
+            attn1_weights = nn.functional.softmax(attn1_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            attn1_weights = nn.functional.dropout(attn1_weights, p=self.attention_dropout, training=self.training)
 
-        attn2_weights = nn.functional.softmax(attn2_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn2_weights = nn.functional.dropout(attn2_weights, p=self.attention_dropout, training=self.training)
+            attn2_weights = nn.functional.softmax(attn2_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            attn2_weights = nn.functional.dropout(attn2_weights, p=self.attention_dropout, training=self.training)
 
-        adapter_lambda_d = 10
-        adapter_lambda_c = 1
+            adapter_lambda_d = self.adapter_lambda_d
+            adapter_lambda_c = 1
 
-        attn_weights = adapter_lambda_d * (attn1_weights - attn2_weights) + adapter_lambda_c * (attn1_weights + attn2_weights) / 2
+            attn_weights = adapter_lambda_d * (attn1_weights - attn2_weights) + adapter_lambda_c * (attn1_weights + attn2_weights) / 2
+        else:
+            key_states = repeat_kv(key_states, self.num_key_value_groups)
+            value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+            attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+
+            if attention_mask is not None:  # no matter the length, we just slice it
+                causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+                attn_weights = attn_weights + causal_mask
+
+            # upcast attention to fp32
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+        
         attn_output = torch.matmul(attn_weights, value_states)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
@@ -543,51 +563,66 @@ class LlamaFlashAttention2(LlamaAttention):
             query_states = query_states.to(target_dtype)
             key_states = key_states.to(target_dtype)
             value_states = value_states.to(target_dtype)
+            
+        if self.layer_idx % self.adapter_layer == 0:    
+            k_len = key_states.shape[1]
 
-        k_len = key_states.shape[1]
+            q1_states = self.q1_adapter(query_states.reshape(bsz, q_len, -1).contiguous())
+            k1_states = self.k1_adapter(key_states.reshape(bsz, k_len, -1).contiguous())
 
-        q1_states = self.q1_adapter(query_states.reshape(bsz, q_len, -1).contiguous())
-        k1_states = self.k1_adapter(key_states.reshape(bsz, k_len, -1).contiguous())
+            q2_states = self.q2_adapter(query_states.reshape(bsz, q_len, -1).contiguous())
+            k2_states = self.k2_adapter(key_states.reshape(bsz, k_len, -1).contiguous())    
 
-        q2_states = self.q2_adapter(query_states.reshape(bsz, q_len, -1).contiguous())
-        k2_states = self.k2_adapter(key_states.reshape(bsz, k_len, -1).contiguous())    
+            q1_states = q1_states.view(bsz, q_len, self.num_heads, self.head_dim)
+            k1_states = k1_states.view(bsz, k_len, self.num_key_value_heads, self.head_dim)
 
-        q1_states = q1_states.view(bsz, q_len, self.num_heads, self.head_dim)
-        k1_states = k1_states.view(bsz, k_len, self.num_key_value_heads, self.head_dim)
+            q2_states = q2_states.view(bsz, q_len, self.num_heads, self.head_dim)
+            k2_states = k2_states.view(bsz, k_len, self.num_key_value_heads, self.head_dim)
 
-        q2_states = q2_states.view(bsz, q_len, self.num_heads, self.head_dim)
-        k2_states = k2_states.view(bsz, k_len, self.num_key_value_heads, self.head_dim)
+            attn1_output = _flash_attention_forward(
+                q1_states,
+                k1_states,
+                value_states,
+                attention_mask,
+                q_len,
+                position_ids=position_ids,
+                dropout=dropout_rate,
+                sliding_window=getattr(self, "sliding_window", None),
+                use_top_left_mask=self._flash_attn_uses_top_left_mask,
+                is_causal=self.is_causal,
+            )
 
-        attn1_output = _flash_attention_forward(
-            q1_states,
-            k1_states,
-            value_states,
-            attention_mask,
-            q_len,
-            position_ids=position_ids,
-            dropout=dropout_rate,
-            sliding_window=getattr(self, "sliding_window", None),
-            use_top_left_mask=self._flash_attn_uses_top_left_mask,
-            is_causal=self.is_causal,
-        )
+            attn2_output = _flash_attention_forward(
+                q2_states,
+                k2_states,
+                value_states,
+                attention_mask,
+                q_len,
+                position_ids=position_ids,
+                dropout=dropout_rate,
+                sliding_window=getattr(self, "sliding_window", None),
+                use_top_left_mask=self._flash_attn_uses_top_left_mask,
+                is_causal=self.is_causal,
+            )
 
-        attn2_output = _flash_attention_forward(
-            q2_states,
-            k2_states,
-            value_states,
-            attention_mask,
-            q_len,
-            position_ids=position_ids,
-            dropout=dropout_rate,
-            sliding_window=getattr(self, "sliding_window", None),
-            use_top_left_mask=self._flash_attn_uses_top_left_mask,
-            is_causal=self.is_causal,
-        )
+            adapter_lambda_d = self.adapter_lambda_d
+            adapter_lambda_c = 1
 
-        adapter_lambda_d = 10
-        adapter_lambda_c = 1
-
-        attn_output = adapter_lambda_d * (attn1_output - attn2_output) + adapter_lambda_c * (attn1_output + attn2_output) / 2
+            attn_output = adapter_lambda_d * (attn1_output - attn2_output) + adapter_lambda_c * (attn1_output + attn2_output) / 2
+            
+        else:
+            attn_output = _flash_attention_forward(
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                q_len,
+                position_ids=position_ids,
+                dropout=dropout_rate,
+                sliding_window=getattr(self, "sliding_window", None),
+                use_top_left_mask=self._flash_attn_uses_top_left_mask,
+                is_causal=self.is_causal,
+            )
 
         attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
         attn_output = self.o_proj(attn_output)
@@ -605,7 +640,7 @@ LLAMA_ATTENTION_CLASSES = {
 
 
 class LlamaDecoderLayer(nn.Module):
-    def __init__(self, config: NoisyLlamaConfig, layer_idx: int):
+    def __init__(self, config: OpampLlamaConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
 
@@ -694,7 +729,7 @@ LLAMA_START_DOCSTRING = r"""
     and behavior.
 
     Parameters:
-        config ([`NoisyLlamaConfig`]):
+        config ([`OpampLlamaConfig`]):
             Model configuration class with all the parameters of the model. Initializing with a config file does not
             load the weights associated with the model, only the configuration. Check out the
             [`~PreTrainedModel.from_pretrained`] method to load the model weights.
@@ -706,7 +741,7 @@ LLAMA_START_DOCSTRING = r"""
     LLAMA_START_DOCSTRING,
 )
 class LlamaPreTrainedModel(PreTrainedModel):
-    config_class = NoisyLlamaConfig
+    config_class = OpampLlamaConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
     _no_split_modules = ["LlamaDecoderLayer"]
@@ -813,10 +848,10 @@ class LlamaModel(LlamaPreTrainedModel):
     Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`LlamaDecoderLayer`]
 
     Args:
-        config: NoisyLlamaConfig
+        config: OpampLlamaConfig
     """
 
-    def __init__(self, config: NoisyLlamaConfig):
+    def __init__(self, config: OpampLlamaConfig):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size

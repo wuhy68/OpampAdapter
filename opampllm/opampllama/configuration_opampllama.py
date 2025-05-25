@@ -23,7 +23,7 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_rope_utils import rope_config_validation
 
 
-class NoisyLlamaConfig(PretrainedConfig):
+class OpampLlamaConfig(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`LlamaModel`]. It is used to instantiate an LLaMA
     model according to the specified arguments, defining the model architecture. Instantiating a configuration with the
@@ -139,7 +139,7 @@ class NoisyLlamaConfig(PretrainedConfig):
     >>> configuration = model.config
     ```"""
 
-    model_type = "noisyllama"
+    model_type = "opampllama"
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
@@ -169,6 +169,8 @@ class NoisyLlamaConfig(PretrainedConfig):
         adapter_dim=64,
         adapter_rank=4,
         adapter_scaling=0.25,
+        adapter_lambda=10,
+        adapter_layer=1,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -203,6 +205,8 @@ class NoisyLlamaConfig(PretrainedConfig):
         self.adapter_dim = adapter_dim
         self.adapter_rank = adapter_rank
         self.adapter_scaling = adapter_scaling
+        self.adapter_lambda = adapter_lambda
+        self.adapter_layer = adapter_layer
 
         super().__init__(
             pad_token_id=pad_token_id,
